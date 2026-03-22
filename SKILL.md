@@ -16,7 +16,7 @@ description: Download static PDF files (annual reports, quarterly results) from 
 | 已有 PDF 的**静态 URL**（年报/季报直链） | **ir-pdf-downloader** |
 | 需要从 **SEC EDGAR** 获取公司财务数据（XBRL、20-F、6-K） | **sec-finance** |
 | IR 页面是 JS 动态渲染，但知道 PDF UUID 形式的静态 URL | **ir-pdf-downloader** |
-| 不知道 PDF URL，需要通过 SEC  filings 找 PDF 链接 | **sec-finance** |
+| 不知道 PDF URL，需要通过 SEC filings 找 PDF 链接 | **sec-finance** |
 | 年报是静态 PDF 文件（非 XBRL），且已知 URL | **ir-pdf-downloader** |
 | 需要 XBRL 数值数据（收入、利润、资产负债表等） | **sec-finance** |
 
