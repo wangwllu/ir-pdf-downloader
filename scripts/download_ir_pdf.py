@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-IR PDF Downloader — Production Script
+IR PDF Downloader — Production Script (v2.0)
 
 Downloads annual reports and quarterly results PDFs from Cloudflare-protected
-Investor Relations (IR) websites.
+Investor Relations (IR) websites. Now works for ANY company's IR site.
 
 Usage:
-    python3 download_ir_pdf.py <url> [url ...]          # Single or multiple URLs
-    python3 download_ir_pdf.py --list urls.txt          # Batch from file
-    python3 download_ir_pdf.py --search-wb ir.jd.com     # Search Wayback Machine for PDF URLs
-    python3 download_ir_pdf.py --verbose <url>           # Debug mode
+    python3 download_ir_pdf.py <url> [url ...]              # Single or multiple URLs
+    python3 download_ir_pdf.py --list urls.txt              # Batch from text file
+    python3 download_ir_pdf.py --input companies.csv        # Batch from CSV/JSON
+    python3 download_ir_pdf.py --search-domain ir.baidu.com  # Search Wayback Machine
+    python3 download_ir_pdf.py --list-known-ir               # List known IR domains
+    python3 download_ir_pdf.py --search-domain ir.alibaba.com --download-found --download-year 2024
 """
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -20,6 +23,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Optional
 
 try:
     import requests
@@ -44,6 +48,86 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds
 MIN_PDF_SIZE = 10_000  # bytes — anything smaller is likely an error page
 PDF_MAGIC = b"%PDF-"
+
+# ─── Known IR Domains for Chinese Stocks ─────────────────────────────────────
+
+KNOWN_IR_DOMAINS = {
+    "JD.com": {
+        "domain": "ir.jd.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "UUID-style URLs, use --search-domain ir.jd.com",
+    },
+    "Alibaba": {
+        "domain": "ir.alibabagroup.com",
+        "pattern": "*/en-US/assets/pdf/annual-report/*.pdf",
+        "note": "Also: annual reports at /en-US/press/press-releases/",
+    },
+    "Baidu": {
+        "domain": "ir.baidu.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "UUID-style URLs, use --search-domain ir.baidu.com",
+    },
+    "Tencent": {
+        "domain": "ir.tencent.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Annual reports at ir.tencent.com",
+    },
+    "PDD Holdings": {
+        "domain": "ir.pddgroup.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.pddgroup.com",
+    },
+    "NetEase": {
+        "domain": "ir.163.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.163.com",
+    },
+    "Meituan": {
+        "domain": "ir.meituan.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.meituan.com",
+    },
+    "Xiaomi": {
+        "domain": "ir.xiaomi.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.xiaomi.com",
+    },
+    "NIO": {
+        "domain": "ir.nio.cn",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.nio.cn",
+    },
+    "Li Auto": {
+        "domain": "ir.lixiang.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.lixiang.com",
+    },
+    "Bilibili": {
+        "domain": "ir.bilibili.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.bilibili.com",
+    },
+    "Trip.com": {
+        "domain": "ir.trip.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.trip.com",
+    },
+    "Ke Holdings": {
+        "domain": "ir.ke.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.ke.com",
+    },
+    "XPeng": {
+        "domain": "ir.xpeng.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.xpeng.com",
+    },
+    "ByteDance": {
+        "domain": "ir.bytedance.com",
+        "pattern": "*/static-files/*.pdf",
+        "note": "Use --search-domain ir.bytedance.com",
+    },
+}
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -134,7 +218,6 @@ def infer_output_dir(url: str, output_dir: str | None) -> Path:
     if output_dir:
         base = Path(output_dir)
     else:
-        # Default: ./downloads/
         base = Path("downloads")
     base.mkdir(parents=True, exist_ok=True)
     return base
@@ -142,7 +225,7 @@ def infer_output_dir(url: str, output_dir: str | None) -> Path:
 
 # ─── Core Downloader ───────────────────────────────────────────────────────────
 
-def download_pdf(
+def download_from_url(
     url: str,
     output_path: Path | None = None,
     referer: str | None = None,
@@ -152,7 +235,8 @@ def download_pdf(
     log: Logger | None = None,
 ) -> Path | None:
     """
-    Download a single PDF from an IR website.
+    Generic PDF download for ANY IR website.
+    Auto-detects Referer from URL domain.
 
     Returns the Path on success, None on failure.
     """
@@ -161,7 +245,7 @@ def download_pdf(
 
     log.debug(f"Downloading: {url}")
 
-    # Build headers
+    # Build headers — auto-detect Referer from URL
     resolved_referer = referer or infer_referer(url)
     headers = {
         **DEFAULT_HEADERS,
@@ -178,7 +262,7 @@ def download_pdf(
             resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
 
             if resp.status_code == 403:
-                last_error = f"HTTP 403 Forbidden — IR site blocked the request. Check Referer header (current: {resolved_referer})."
+                last_error = f"HTTP 403 Forbidden — IR site blocked. Check Referer (current: {resolved_referer})"
                 log.warn(f"Attempt {attempt}: {last_error}")
             elif resp.status_code == 404:
                 last_error = f"HTTP 404 Not Found — PDF URL does not exist: {url}"
@@ -188,29 +272,23 @@ def download_pdf(
                 last_error = f"HTTP {resp.status_code} — unexpected response"
                 log.warn(f"Attempt {attempt}: {last_error}")
             else:
-                # Success — read content
                 data = b"".join(resp.iter_content(chunk_size=65536))
-
                 content_type = resp.headers.get("Content-Type", "")
                 log.debug(f"Content-Type: {content_type}, Size: {len(data):,} bytes")
 
-                # Check size
                 if len(data) < MIN_PDF_SIZE:
-                    last_error = f"Downloaded file too small ({len(data):,} bytes) — likely an error/challenge page"
+                    last_error = f"Downloaded file too small ({len(data):,} bytes) — likely error/challenge page"
                     log.warn(f"Attempt {attempt}: {last_error}")
                 else:
-                    # Determine output path
                     if output_path is None:
                         fname = extract_filename_from_url(url)
                         out_dir = infer_output_dir(url, None)
                         output_path = out_dir / fname
 
                     output_path.parent.mkdir(parents=True, exist_ok=True)
-
                     with open(output_path, "wb") as f:
                         f.write(data)
 
-                    # Verify PDF integrity
                     valid, reason = verify_pdf(output_path)
                     if not valid:
                         output_path.unlink(missing_ok=True)
@@ -238,105 +316,194 @@ def download_pdf(
     return None
 
 
-# ─── Wayback Machine Search ─────────────────────────────────────────────────────
+# Alias for backwards compatibility
+def download_pdf(*args, **kwargs) -> Path | None:
+    return download_from_url(*args, **kwargs)
 
-def search_wayback(domain: str, verbose: bool = False, log: Logger | None = None) -> list[str]:
+
+# ─── Wayback Machine CDX Search ─────────────────────────────────────────────────
+
+def search_wayback_cdx(
+    domain: str,
+    verbose: bool = False,
+    log: Logger | None = None,
+    filter_year: int | None = None,
+) -> list[dict]:
     """
-    Search Wayback Machine CDX API for PDF URLs on a given domain.
-    Returns list of PDF URLs found.
+    Search Wayback Machine CDX API for ALL PDF URLs under a domain.
+    Returns list of dicts with keys: url, timestamp, statuscode.
     """
     if log is None:
         log = Logger(verbose=verbose)
 
-    log.info(f"Searching Wayback Machine for PDFs on: {domain}")
+    log.info(f"Searching Wayback Machine CDX for PDFs under: {domain}")
 
-    # Encode domain for CDX query
-    # Match URLs like ir.jd.com/static-files/*.pdf
-    wildcard = f"*{domain}*/static-files/*.pdf"
-    encoded = urllib.parse.quote(wildcard)
+    # CDX API: find ALL PDF files anywhere under the domain (not just static-files)
+    # We use from:*/to:* to get all time periods
+    # Match: *://{domain}/*/*.pdf  OR  *://{domain}/*.pdf
+    # The CDX API uses URL pattern matching
+    url_patterns = [
+        f"*{domain}*/*.pdf",
+        f"*{domain}*/**/*.pdf",
+    ]
 
-    cdx_url = (
-        f"https://web.archive.org/cdx/search/cdx"
-        f"?url={encoded}"
-        f"&output=json"
-        f"&limit=50"
-        f"&fl=original,statuscode,mimetype"
-        f"&filter=statuscode:200"
-        f"&filter=mimetype:application/pdf"
-    )
+    all_rows = []
 
-    log.debug(f"CDX URL: {cdx_url}")
-
-    try:
-        resp = requests.get(
-            cdx_url,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-            timeout=20,
+    for pattern in url_patterns:
+        encoded = urllib.parse.quote(pattern, safe="")
+        cdx_url = (
+            f"https://web.archive.org/cdx/search/cdx"
+            f"?url={encoded}"
+            f"&output=json"
+            f"&limit=200"
+            f"&fl=original,statuscode,mimetype,timestamp"
+            f"&filter=statuscode:200"
+            f"&filter=mimetype:application/pdf"
+            f"&collapse=original"  # Deduplicate by URL
         )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        log.error(f"Wayback Machine CDX request failed: {e}")
-        return []
 
-    try:
-        data = resp.json()
-    except json.JSONDecodeError:
-        log.error("Failed to parse Wayback Machine CDX response (not JSON)")
-        return []
+        log.debug(f"CDX query: {pattern}")
+        log.debug(f"URL: {cdx_url}")
 
-    if not data or len(data) < 2:
-        log.warn(f"No PDF snapshots found for {domain}")
-        return []
+        try:
+            resp = requests.get(
+                cdx_url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-    # First row is header: ["original", "statuscode", "mimetype"]
-    header = data[0]
-    rows = data[1:]
-    log.info(f"Found {len(rows)} PDF snapshot(s) in Wayback Machine")
+            if data and len(data) > 1:
+                # First row is header
+                header = data[0]
+                rows = data[1:]
+                for row in rows:
+                    if len(row) >= 4:
+                        url, status, mimetype, timestamp = row[0], row[1], row[2], row[3]
+                        # Filter by year if requested
+                        if filter_year:
+                            ts_year = timestamp[:4]
+                            if str(filter_year) != ts_year:
+                                continue
+                        all_rows.append({
+                            "url": url,
+                            "timestamp": timestamp,
+                            "statuscode": status,
+                            "domain": domain,
+                        })
+        except requests.exceptions.RequestException as e:
+            log.warn(f"CDX request failed for pattern '{pattern}': {e}")
+        except json.JSONDecodeError:
+            log.warn(f"Failed to parse CDX response for pattern '{pattern}'")
 
-    urls = []
-    for row in rows:
-        if len(row) >= 1:
-            url = row[0]
-            urls.append(url)
-            log.debug(f"  Found: {url}")
+    # Deduplicate by URL
+    seen = set()
+    unique = []
+    for item in all_rows:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            unique.append(item)
 
-    return urls
+    log.info(f"Found {len(unique)} unique PDF URL(s)" + (f" from year {filter_year}" if filter_year else ""))
+    return unique
 
 
-# ─── Batch Download ─────────────────────────────────────────────────────────────
+def wayback_search_to_urls(results: list[dict]) -> list[str]:
+    """Extract just the URLs from CDX search results."""
+    return [r["url"] for r in results]
 
-def batch_download(
-    urls: list[str],
-    output_dir: str | None = None,
-    referer: str | None = None,
+
+def print_wayback_results(results: list[dict], log: Logger):
+    """Print CDX results in a readable format."""
+    if not results:
+        log.warn("No PDFs found.")
+        return
+
+    log.info(f"Found {len(results)} PDF URL(s):")
+    print()
+    for i, r in enumerate(results, 1):
+        ts = r.get("timestamp", "unknown")
+        year = ts[:4] if ts and len(ts) >= 4 else "?"
+        print(f"  [{i}] {year}  {r['url']}")
+    print()
+
+
+# ─── Batch Download from CSV/JSON ───────────────────────────────────────────────
+
+def load_input_file(path: str, log: Logger) -> list[dict]:
+    """
+    Load company data from CSV or JSON.
+    CSV columns: company, url, out_dir (all optional except url)
+    JSON: list of {company, url, out_dir} objects
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        log.error(f"Input file not found: {path}")
+        sys.exit(1)
+
+    ext = path_obj.suffix.lower()
+    entries = []
+
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            entries = data
+        else:
+            log.error("JSON must be a list of objects with 'url' field")
+            sys.exit(1)
+    elif ext in (".csv", ".tsv"):
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("url", "").strip():
+                    entries.append({
+                        "company": row.get("company", "").strip(),
+                        "url": row.get("url", "").strip(),
+                        "out_dir": row.get("out_dir", "").strip(),
+                    })
+    else:
+        log.error(f"Unsupported file type: {ext} (use .csv or .json)")
+        sys.exit(1)
+
+    log.info(f"Loaded {len(entries)} entry(ies) from {path}")
+    return entries
+
+
+def batch_from_input(
+    entries: list[dict],
     verbose: bool = False,
     delay: float = 1.0,
-) -> dict[str, Path | None]:
+    filter_year: int | None = None,
+) -> dict:
     """
-    Download multiple PDFs in sequence.
-
-    Returns a dict mapping url -> Path (or None if failed).
+    Download PDFs from a list of {company, url, out_dir} entries.
+    Returns {url: Path_or_None}.
     """
     log = Logger(verbose=verbose)
     results = {}
 
-    for i, url in enumerate(urls, 1):
-        log.info(f"[{i}/{len(urls)}] {url}")
-        out_dir = infer_output_dir(url, output_dir)
-        path = download_pdf(
+    for i, entry in enumerate(entries, 1):
+        url = entry["url"]
+        company = entry.get("company", "") or "unknown"
+        out_dir = entry.get("out_dir", "") or None
+
+        log.info(f"[{i}/{len(entries)}] {company}: {url}")
+        path = download_from_url(
             url,
             output_path=None,
-            referer=referer,
+            referer=None,
             verbose=verbose,
             log=log,
         )
         results[url] = path
-        if delay > 0 and i < len(urls):
-            log.debug(f"Waiting {delay}s before next download...")
+
+        if delay > 0 and i < len(entries):
             time.sleep(delay)
 
     succeeded = sum(1 for v in results.values() if v is not None)
-    log.info(f"Batch complete: {succeeded}/{len(urls)} succeeded")
+    log.info(f"Batch complete: {succeeded}/{len(entries)} succeeded")
     return results
 
 
@@ -345,38 +512,54 @@ def batch_download(
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="download_ir_pdf.py",
-        description="Download IR PDFs (annual reports, quarterly results) from Cloudflare-protected websites.",
+        description="Download IR PDFs (annual reports, quarterly results) from ANY IR website. "
+                    "Auto-detects Referer from URL domain.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Download a single PDF
+  # Download a single PDF (auto-detects Referer from URL)
   python3 download_ir_pdf.py "https://ir.jd.com/static-files/..."
 
-  # Download with verbose output
-  python3 download_ir_pdf.py --verbose "https://ir.jd.com/static-files/..."
-
-  # Batch from a text file (one URL per line)
+  # Batch from text file
   python3 download_ir_pdf.py --list urls.txt
 
-  # Search Wayback Machine for PDFs on ir.jd.com
-  python3 download_ir_pdf.py --search-wb ir.jd.com
+  # Search Wayback Machine for PDFs on any IR domain
+  python3 download_ir_pdf.py --search-domain ir.baidu.com
 
-  # Batch from Wayback Machine search
-  python3 download_ir_pdf.py --search-wb ir.jd.com --download-found
+  # Search + download from specific year
+  python3 download_ir_pdf.py --search-domain ir.alibaba.com --download-found --download-year 2024
+
+  # Batch from CSV/JSON with company names and output dirs
+  python3 download_ir_pdf.py --input companies.csv
+
+  # List known Chinese stock IR domains
+  python3 download_ir_pdf.py --list-known-ir
         """,
     )
 
     parser.add_argument("urls", nargs="*", help="One or more PDF URLs to download")
     parser.add_argument("--list", "-l", metavar="FILE",
                         help="Path to a text file with URLs (one per line)")
-    parser.add_argument("--search-wb", "-w", metavar="DOMAIN",
-                        help="Search Wayback Machine for PDF URLs on this domain (e.g. ir.jd.com)")
+    parser.add_argument("--input", "-i", metavar="FILE",
+                        help="CSV or JSON file with columns: company, url, out_dir")
+    parser.add_argument(
+        "--search-domain", "-s", metavar="DOMAIN",
+        help="Search Wayback Machine CDX for PDFs under this domain (e.g. ir.baidu.com)"
+    )
+    parser.add_argument(
+        "--search-wb", "-w", metavar="DOMAIN",
+        help="Alias for --search-domain (Wayback Machine search)"
+    )
     parser.add_argument("--download-found", "-d", action="store_true",
-                        help="Download all PDFs found by --search-wb")
+                        help="Download all PDFs found by --search-domain")
+    parser.add_argument("--download-year", "-y", type=int, metavar="YEAR",
+                        help="Only download PDFs from this year (e.g. 2024)")
+    parser.add_argument("--list-known-ir", action="store_true",
+                        help="List known IR domains for Chinese stocks and exit")
     parser.add_argument("--output", "-o", metavar="DIR",
                         help="Output directory (default: ./downloads/)")
     parser.add_argument("--referer", "-r", metavar="URL",
-                        help="Custom Referer header (default: inferred from PDF URL)")
+                        help="Custom Referer header (default: auto-detected from URL)")
     parser.add_argument("--timeout", "-t", type=int, default=DEFAULT_TIMEOUT,
                         help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--retries", type=int, default=MAX_RETRIES,
@@ -400,41 +583,69 @@ def read_url_list(path: str) -> list[str]:
     return urls
 
 
+def list_known_ir(log: Logger):
+    """Print the known IR domains table."""
+    log.info("Known Chinese Stock IR Domains:")
+    print()
+    print(f"{'Company':<20} {'Domain':<25} {'Pattern'}")
+    print("-" * 80)
+    for company, info in KNOWN_IR_DOMAINS.items():
+        domain = info["domain"]
+        pattern = info["pattern"]
+        print(f"{company:<20} {domain:<25} {pattern}")
+    print()
+    print("Usage: python3 download_ir_pdf.py --search-domain <domain> --download-found")
+
+
 def main():
     args = parse_args()
     log = Logger(verbose=args.verbose)
 
+    # ── List known IR domains ─────────────────────────────────────────────────
+    if args.list_known_ir:
+        list_known_ir(log)
+        return
+
     # ── Wayback Machine search mode ──────────────────────────────────────────
-    if args.search_wb:
-        domain = args.search_wb
+    search_domain = args.search_domain or args.search_wb
+
+    if search_domain:
+        domain = search_domain
         if not re.match(r"^[a-zA-Z0-9.\-]+$", domain):
             log.error(f"Invalid domain format: {domain}")
             sys.exit(1)
 
-        pdf_urls = search_wayback(domain, verbose=args.verbose, log=log)
+        results = search_wayback_cdx(
+            domain,
+            verbose=args.verbose,
+            log=log,
+            filter_year=args.download_year,
+        )
+        print_wayback_results(results, log)
 
-        if not pdf_urls:
+        if not results:
             log.warn("No PDFs found.")
             sys.exit(0)
 
-        print("\n--- Found PDF URLs ---")
-        for url in pdf_urls:
-            print(url)
-
         if args.download_found:
-            print(f"\n--- Downloading {len(pdf_urls)} PDF(s) ---\n")
-            # Infer referer for batch
+            pdf_urls = wayback_search_to_urls(results)
+            print(f"--- Downloading {len(pdf_urls)} PDF(s) ---\n")
             wb_referer = f"https://{domain}/"
-            batch_download(
-                pdf_urls,
-                output_dir=args.output,
-                referer=wb_referer,
-                verbose=args.verbose,
-                delay=args.delay,
-            )
+            for i, url in enumerate(pdf_urls, 1):
+                log.info(f"[{i}/{len(pdf_urls)}] {url}")
+                download_from_url(
+                    url,
+                    output_path=None,
+                    referer=wb_referer,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    verbose=args.verbose,
+                    log=log,
+                )
+                if args.delay > 0 and i < len(pdf_urls):
+                    time.sleep(args.delay)
         else:
-            print(f"\n(Use --download-found to download all {len(pdf_urls)} PDFs)")
-
+            print(f"(Use --download-found to download all {len(results)} PDFs)")
         return
 
     # ── Collect URLs ──────────────────────────────────────────────────────────
@@ -448,8 +659,27 @@ def main():
             sys.exit(1)
         urls = read_url_list(str(path))
         log.info(f"Loaded {len(urls)} URL(s) from {path}")
+    elif args.input:
+        # Load from CSV/JSON and download
+        entries = load_input_file(args.input, log)
+        if not entries:
+            log.error("No entries found in input file.")
+            sys.exit(1)
+        results = batch_from_input(
+            entries,
+            verbose=args.verbose,
+            delay=args.delay,
+            filter_year=args.download_year,
+        )
+        failed = [url for url, path in results.items() if path is None]
+        if failed:
+            log.warn(f"{len(failed)} download(s) failed:")
+            for url in failed:
+                log.warn(f"  FAILED: {url}")
+            sys.exit(1)
+        return
     else:
-        log.error("No URLs provided. Use positional args, --list FILE, or --search-wb DOMAIN.")
+        log.error("No URLs provided. Use positional args, --list FILE, --input FILE, or --search-domain DOMAIN.")
         parser.print_help()
         sys.exit(1)
 
@@ -460,7 +690,7 @@ def main():
     # ── Download ──────────────────────────────────────────────────────────────
     if len(urls) == 1:
         log.info(f"Downloading: {urls[0]}")
-        result = download_pdf(
+        result = download_from_url(
             urls[0],
             output_path=None,
             referer=args.referer,
@@ -472,13 +702,22 @@ def main():
         if result is None:
             sys.exit(1)
     else:
-        results = batch_download(
-            urls,
-            output_dir=args.output,
-            referer=args.referer,
-            verbose=args.verbose,
-            delay=args.delay,
-        )
+        results = {}
+        for i, url in enumerate(urls, 1):
+            log.info(f"[{i}/{len(urls)}] {url}")
+            path = download_from_url(
+                url,
+                output_path=None,
+                referer=args.referer,
+                timeout=args.timeout,
+                retries=args.retries,
+                verbose=args.verbose,
+                log=log,
+            )
+            results[url] = path
+            if args.delay > 0 and i < len(urls):
+                time.sleep(args.delay)
+
         failed = [url for url, path in results.items() if path is None]
         if failed:
             log.warn(f"{len(failed)} download(s) failed:")
